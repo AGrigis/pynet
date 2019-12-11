@@ -24,17 +24,19 @@ from pynet.core import Base
 class UNetEncoder(Base):
     """ UNet (2014) by Long and Shelhamer.
     """
-    def __init__(self, num_classes, in_channels=1, depth=5, start_filts=64,
-                 up_mode="transpose", merge_mode="concat", batchnorm=False,
-                 dim="3d", pretrained=None, optimizer_name="Adam",
-                 learning_rate=1e-3, loss_name="NLLLoss", metrics=None,
-                 use_cuda=False, **kwargs):
+    def __init__(self, num_classes, ndims=3, in_channels=1, depth=5,
+                 start_filts=64, up_mode="transpose", merge_mode="concat",
+                 batchnorm=False, debug=False, pretrained=None,
+                 optimizer_name="Adam", learning_rate=1e-3,
+                 loss_name="NLLLoss", metrics=None, use_cuda=False, **kwargs):
         """ Class initilization.
 
         Parameters
         ----------
         num_classes: int
             the number of features in the output segmentation map.
+        ndims: int, default 3
+            the input data dimsensions: 2 or 3.
         in_channels: int, default 1
             number of channels in the input tensor.
         depth: int, default 5
@@ -48,8 +50,8 @@ class UNetEncoder(Base):
             the skip connections merging strategy.
         batchnorm: bool, default False
             normalize the inputs of the activation function.
-        dim: str, default '3d'
-            '3d' or '2d' input data.
+        debug: bool, default False
+            print the shape of the tensors during the forward pass.
         pretrained: path, default None
             path to the pretrained model or weights.
         optimizer_name: str, default 'Adam'
@@ -70,13 +72,14 @@ class UNetEncoder(Base):
         """
         self.model = models.UNet(
             num_classes=num_classes,
+            ndims=ndims,
             in_channels=in_channels,
             depth=depth,
             start_filts=start_filts,
             up_mode=up_mode,
             merge_mode=merge_mode,
             batchnorm=batchnorm,
-            dim=dim)
+            debug=debug)
         super().__init__(
             optimizer_name=optimizer_name,
             learning_rate=learning_rate,

@@ -64,18 +64,18 @@ def my_loss(x, y):
     y = torch.argmax(y, dim=1).type(torch.LongTensor)
     criterion = nn.CrossEntropyLoss()
     return criterion(x, y)
-outdir = "/tmp/pynet"
+outdir = "/tmp/pynet_echocardiography"
 trained_model = os.path.join(outdir, "model_0_epoch_9.pth")
 if os.path.isfile(trained_model):
     unet = UNetEncoder(
         num_classes=4,
+        ndims=2,
         in_channels=1,
         depth=5, 
         start_filts=16,
         up_mode="upsample", 
         merge_mode="concat",
         batchnorm=False,
-        dim="2d",
         optimizer_name="Adam",
         learning_rate=5e-4,
         metrics=["multiclass_dice"],
@@ -86,13 +86,14 @@ if os.path.isfile(trained_model):
 else:
     unet = UNetEncoder(
         num_classes=4,
+        ndims=2,
         in_channels=1,
         depth=5, 
         start_filts=16,
         up_mode="upsample", 
         merge_mode="concat",
         batchnorm=False,
-        dim="2d",
+        debug=False,
         optimizer_name="Adam",
         learning_rate=5e-4,
         metrics=["multiclass_dice"],

@@ -12,7 +12,6 @@ The U-Net is a convolutional encoder-decoder neural network.
 """
 
 # Imports
-import ast
 import collections
 import torch
 import torch.nn as nn
@@ -27,6 +26,7 @@ class UNet(nn.Module):
     expansive pathway) about an input tensor is merged with
     information representing the localization of details
     (from the encoding, compressive pathway).
+
     Modifications to the original paper:
 
     - padding is used in 3x3x3 convolutions to prevent loss
@@ -40,17 +40,24 @@ class UNet(nn.Module):
       to reduce channel dimensionality by a factor of 2.
       This channel halving happens with the convolution in
       the tranpose convolution (specified by upmode='transpose')
+
+    Important: no softmax is used. This means you need to use
+    a loss like nn.CrossEntropyLoss in your training script, that includes a
+    softmax already.
     """
 
-    def __init__(self, num_classes, in_channels=1, depth=5,
+    def __init__(self, num_classes, ndims=3, in_channels=1, depth=5,
                  start_filts=64, up_mode="transpose",
-                 merge_mode="concat", batchnorm=False, dim="3d"):
+                 merge_mode="concat", batchnorm=False, dim="3d",
+                 debug=False):
         """ Init class.
 
         Parameters
         ----------
         num_classes: int
             the number of features in the output segmentation map.
+        ndims: int, default 3
+            the input data dimsensions: 2 or 3.
         in_channels: int, default 1
             number of channels in the input tensor.
         depth: int, default 5
@@ -64,44 +71,59 @@ class UNet(nn.Module):
             the skip connections merging strategy.
         batchnorm: bool, default False
             normalize the inputs of the activation function.
-        dim: str, default '3d'
-            '3d' or '2d' input data.
+        debug: bool, default False
+            print the shape of the tensors during the forward pass.
         """
         # Inheritance
         super(UNet, self).__init__()
 
         # Check inputs
-        if dim in ("2d", "3d"):
-            self.dim = dim
-        else:
+        if ndims not in (2, 3):
             raise ValueError(
-                "'{}' is not a valid mode for merging up and down paths. Only "
-                "'3d' and '2d' are allowed.".format(dim))
-        if up_mode in ("transpose", "upsample"):
-            self.up_mode = up_mode
-        else:
+                "'{}' is not a valid dimension for input data: must be in "
+                "{2, 3}.".format(ndims))
+        if up_mode not in ("transpose", "upsample"):
             raise ValueError(
                 "'{}' is not a valid mode for upsampling. Only 'transpose' "
                 "and 'upsample' are allowed.".format(up_mode))
-        if merge_mode in ("concat", "add"):
-            self.merge_mode = merge_mode
-        else:
+        if merge_mode not in ("concat", "add"):
             raise ValueError(
                 "'{}' is not a valid mode for merging up and down paths. Only "
                 "'concat' and 'add' are allowed.".format(up_mode))
-        if self.up_mode == "upsample" and self.merge_mode == "add":
+        if up_mode == "upsample" and merge_mode == "add":
             raise ValueError(
                 "up_mode 'upsample' is incompatible with merge_mode 'add' at "
                 "the moment because it doesn't make sense to use nearest "
                 "neighbour to reduce depth channels (by half).")
 
         # Declare class parameters
+        self.ndims = ndims
+        self.up_mode = up_mode
+        self.merge_mode = merge_mode
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.start_filts = start_filts
         self.depth = depth
+        self.debug = debug
         self.down = []
         self.up = []
+
+        # Define operators
+        OperatorsItem = collections.namedtuple(
+            "OperatorsItem", ["conv", "norm", "convt", "pool"])
+        self.operators = {}
+        if self.ndims == 3:
+            conv = nn.Conv3d
+            norm = nn.BatchNorm3d
+            convt = nn.ConvTranspose3d
+            pool = nn.MaxPool3d
+        else:
+            conv = nn.Conv2d
+            norm = nn.BatchNorm2d
+            convt = nn.ConvTranspose2d
+            pool = nn.MaxPool2d
+        self.operators = OperatorsItem(
+            conv=conv, norm=norm, convt=convt, pool=pool)
 
         # Create the encoder pathway
         for cnt in range(depth):
@@ -109,8 +131,8 @@ class UNet(nn.Module):
             out_channels = self.start_filts * (2**cnt)
             pooling = False if cnt == 0 else True
             self.down.append(
-                Down(in_channels, out_channels, self.dim, pooling=pooling,
-                     batchnorm=batchnorm))
+                Down(in_channels, out_channels, self.operators,
+                     pooling=pooling, batchnorm=batchnorm))
 
         # Create the decoder pathway
         # - careful! decoding only requires depth-1 blocks
@@ -118,7 +140,7 @@ class UNet(nn.Module):
             in_channels = out_channels
             out_channels = in_channels // 2
             self.up.append(
-                Up(in_channels, out_channels, up_mode=up_mode, dim=self.dim,
+                Up(in_channels, out_channels, self.operators, up_mode=up_mode,
                    merge_mode=merge_mode, batchnorm=batchnorm))
 
         # Add the list of modules to current module
@@ -126,65 +148,69 @@ class UNet(nn.Module):
         self.up = nn.ModuleList(self.up)
 
         # Get ouptut segmentation
-        self.conv_final = Conv1x1x1(out_channels, self.num_classes, self.dim)
+        self.conv_final = Conv1x1x1(
+            out_channels, self.num_classes, self.operators)
 
         # Kernel initializer
         self.kernel_initializer()
 
     def kernel_initializer(self):
         for module in self.modules():
-            self.init_weight(module, self.dim)
+            self.init_weight(module, self.operators)
 
     @staticmethod
-    def init_weight(module, dim):
-        if isinstance(module, eval("nn.Conv{0}".format(dim))):
+    def init_weight(module, operators):
+        if isinstance(module, operators.conv):
             nn.init.xavier_normal_(module.weight)
             nn.init.constant_(module.bias, 0)
 
     def forward(self, x):
+        if self.debug:
+            print("-" * 50)
+            print("Tensor: ", x.shape)
         encoder_outs = []
-        for module in self.down:
+        for cnt, module in enumerate(self.down):
             x = module(x)
+            if self.debug:
+                print("Down {0}: ".format(cnt), x.shape)
             encoder_outs.append(x)
         encoder_outs = encoder_outs[:-1][::-1]
         for cnt, module in enumerate(self.up):
             x_up = encoder_outs[cnt]
             x = module(x, x_up)
-
-        # No softmax is used. This means you need to use
-        # nn.CrossEntropyLoss in your training script,
-        # as this module includes a softmax already.
+            if self.debug:
+                print("Up {0}: ".format(cnt), x.shape)
         x = self.conv_final(x)
+        if self.debug:
+            print("Final conv: ", x.shape)
         return x
 
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, dim, kernel_size=3, stride=1,
-                 padding=1, bias=True, batchnorm=True):
+    def __init__(self, in_channels, out_channels, operators, kernel_size=3,
+                 stride=1, padding=1, bias=True, batchnorm=True):
         super(DoubleConv, self).__init__()
         if batchnorm:
             self.ops = nn.Sequential(collections.OrderedDict([
-                ("conv1", eval(
-                    "nn.Conv{0}(in_channels, out_channels, kernel_size, "
-                    "stride=stride, padding=padding, bias=bias)".format(dim))),
-                ("norm1", eval(
-                    "nn.BatchNorm{0}(out_channels)".format(dim))),
+                ("conv1", operators.conv(
+                    in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, bias=bias)),
+                ("norm1", operators.norm(out_channels)),
                 ("leakyrelu1", nn.LeakyReLU()),
-                ("conv2", eval(
-                    "nn.Conv{0}(out_channels, out_channels, kernel_size, "
-                    "stride=stride, padding=padding, bias=bias)".format(dim))),
-                ("norm2", eval(
-                    "nn.BatchNorm{0}(out_channels)".format(dim))),
+                ("conv2", operators.conv(
+                    out_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, bias=bias)),
+                ("norm2", operators.norm(out_channels)),
                 ("leakyrelu2", nn.LeakyReLU())]))
         else:
             self.ops = nn.Sequential(collections.OrderedDict([
-                ("conv1", eval(
-                    "nn.Conv{0}(in_channels, out_channels, kernel_size, "
-                    "stride=stride, padding=padding, bias=bias)".format(dim))),
+                ("conv1", operators.conv(
+                    in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, bias=bias)),
                 ("leakyrelu1", nn.LeakyReLU()),
-                ("conv2", eval(
-                    "nn.Conv{0}(out_channels, out_channels, kernel_size, "
-                    "stride=stride, padding=padding, bias=bias)".format(dim))),
+                ("conv2", operators.conv(
+                    out_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, bias=bias)),
                 ("leakyrelu2", nn.LeakyReLU())]))
 
     def forward(self, x):
@@ -192,22 +218,19 @@ class DoubleConv(nn.Module):
         return x
 
 
-def UpConv(in_channels, out_channels, dim, mode="transpose"):
+def UpConv(in_channels, out_channels, operators, mode="transpose"):
     if mode == "transpose":
-        return eval(
-            "nn.ConvTranspose{0}(in_channels, out_channels, kernel_size=2, "
-            "stride=2)".format(dim))
+        return convt(in_channels, out_channels, kernel_size=2, stride=2)
     else:
         # out_channels is always going to be the same as in_channels
         return nn.Sequential(collections.OrderedDict([
             ("up", nn.Upsample(mode="nearest", scale_factor=2)),
-            ("conv1x", Conv1x1x1(in_channels, out_channels, dim))]))
+            ("conv1x", Conv1x1x1(in_channels, out_channels, operators))]))
 
 
-def Conv1x1x1(in_channels, out_channels, dim, groups=1):
-    return eval(
-        "nn.Conv{0}(in_channels, out_channels, kernel_size=1, groups=groups, "
-        "stride=1)".format(dim))
+def Conv1x1x1(in_channels, out_channels, operators, groups=1):
+    return operators.conv(
+        in_channels, out_channels, kernel_size=1, groups=groups, stride=1)
 
 
 class Down(nn.Module):
@@ -215,19 +238,21 @@ class Down(nn.Module):
     A helper Module that performs 2 convolutions and 1 MaxPool.
     A LeakyReLU activation and optionally a BatchNorm follows each convolution.
     """
-    def __init__(self, in_channels, out_channels, dim, pooling=True,
+    def __init__(self, in_channels, out_channels, operators, pooling=True,
                  batchnorm=True):
         super(Down, self).__init__()
         if pooling:
 
             self.ops = nn.Sequential(collections.OrderedDict([
-                ("maxpool", eval("nn.MaxPool{0}(2)".format(dim))),
+                ("maxpool", operators.pool(2)),
                 ("doubleconv", DoubleConv(
-                    in_channels, out_channels, dim, batchnorm=batchnorm))]))
+                    in_channels, out_channels, operators,
+                    batchnorm=batchnorm))]))
         else:
             self.ops = nn.Sequential(collections.OrderedDict([
                 ("doubleconv", DoubleConv(
-                    in_channels, out_channels, dim, batchnorm=batchnorm))]))
+                    in_channels, out_channels, operators,
+                    batchnorm=batchnorm))]))
 
     def forward(self, x):
         x = self.ops(x)
@@ -239,13 +264,14 @@ class Up(nn.Module):
     A helper Module that performs 2 convolutions and 1 UpConvolution.
     A LeakyReLU activation and optionally a BatchNorm follows each convolution.
     """
-    def __init__(self, in_channels, out_channels, dim, merge_mode="concat",
-                 up_mode="transpose", batchnorm=True):
+    def __init__(self, in_channels, out_channels, operators,
+                 merge_mode="concat", up_mode="transpose", batchnorm=True):
         super(Up, self).__init__()
         self.merge_mode = merge_mode
-        self.upconv = UpConv(in_channels, out_channels, dim, mode=up_mode)
+        self.upconv = UpConv(
+            in_channels, out_channels, operators, mode=up_mode)
         self.doubleconv = DoubleConv(
-            in_channels, out_channels, dim, batchnorm=batchnorm)
+            in_channels, out_channels, operators, batchnorm=batchnorm)
 
     def forward(self, x_down, x_up):
         x_down = self.upconv(x_down)
